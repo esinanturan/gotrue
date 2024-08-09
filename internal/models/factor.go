@@ -117,17 +117,19 @@ func ParseAuthenticationMethod(authMethod string) (AuthenticationMethod, error) 
 }
 
 type Factor struct {
-	ID           uuid.UUID          `json:"id" db:"id"`
-	User         User               `json:"-" belongs_to:"user"`
-	UserID       uuid.UUID          `json:"-" db:"user_id"`
-	CreatedAt    time.Time          `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time          `json:"updated_at" db:"updated_at"`
-	Status       string             `json:"status" db:"status"`
-	FriendlyName string             `json:"friendly_name,omitempty" db:"friendly_name"`
-	Secret       string             `json:"-" db:"secret"`
-	FactorType   string             `json:"factor_type" db:"factor_type"`
-	Challenge    []Challenge        `json:"-" has_many:"challenges"`
-	Phone        storage.NullString `json:"phone" db:"phone"`
+	ID uuid.UUID `json:"id" db:"id"`
+	// TODO: Consider removing this nested user field. We don't use it.
+	User             User               `json:"-" belongs_to:"user"`
+	UserID           uuid.UUID          `json:"-" db:"user_id"`
+	CreatedAt        time.Time          `json:"created_at" db:"created_at"`
+	UpdatedAt        time.Time          `json:"updated_at" db:"updated_at"`
+	Status           string             `json:"status" db:"status"`
+	FriendlyName     string             `json:"friendly_name,omitempty" db:"friendly_name"`
+	Secret           string             `json:"-" db:"secret"`
+	FactorType       string             `json:"factor_type" db:"factor_type"`
+	Challenge        []Challenge        `json:"-" has_many:"challenges"`
+	Phone            storage.NullString `json:"phone" db:"phone"`
+	LastChallengedAt *time.Time         `json:"last_challenged_at" db:"last_challenged_at"`
 }
 
 func (Factor) TableName() string {
@@ -148,8 +150,12 @@ func NewFactor(user *User, friendlyName string, factorType string, state FactorS
 	return factor
 }
 
-func NewPhoneFactor(user *User, phone, friendlyName string, factorType string, state FactorState) *Factor {
-	factor := NewFactor(user, friendlyName, factorType, state)
+func NewTOTPFactor(user *User, friendlyName string) *Factor {
+	return NewFactor(user, friendlyName, TOTP, FactorStateUnverified)
+}
+
+func NewPhoneFactor(user *User, phone, friendlyName string) *Factor {
+	factor := NewFactor(user, friendlyName, Phone, FactorStateUnverified)
 	factor.Phone = storage.NullString(phone)
 	return factor
 }
@@ -192,8 +198,8 @@ func FindFactorByFactorID(conn *storage.Connection, factorID uuid.UUID) (*Factor
 	return &factor, nil
 }
 
-func DeleteUnverifiedFactors(tx *storage.Connection, user *User) error {
-	if err := tx.RawQuery("DELETE FROM "+(&pop.Model{Value: Factor{}}).TableName()+" WHERE user_id = ? and status = ?", user.ID, FactorStateUnverified.String()).Exec(); err != nil {
+func DeleteUnverifiedFactors(tx *storage.Connection, user *User, factorType string) error {
+	if err := tx.RawQuery("DELETE FROM "+(&pop.Model{Value: Factor{}}).TableName()+" WHERE user_id = ? and status = ? and factor_type = ?", user.ID, FactorStateUnverified.String(), factorType).Exec(); err != nil {
 		return err
 	}
 
@@ -207,7 +213,22 @@ func (f *Factor) CreateChallenge(ipAddress string) *Challenge {
 		FactorID:  f.ID,
 		IPAddress: ipAddress,
 	}
+
 	return challenge
+}
+func (f *Factor) WriteChallengeToDatabase(tx *storage.Connection, challenge *Challenge) error {
+	if challenge.FactorID != f.ID {
+		return errors.New("Can only write challenges that you own")
+	}
+	now := time.Now()
+	f.LastChallengedAt = &now
+	if terr := tx.Create(challenge); terr != nil {
+		return terr
+	}
+	if err := tx.UpdateOnly(f, "last_challenged_at"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (f *Factor) CreatePhoneChallenge(ipAddress string, otpCode string, encrypt bool, encryptionKeyID, encryptionKey string) (*Challenge, error) {
@@ -215,8 +236,6 @@ func (f *Factor) CreatePhoneChallenge(ipAddress string, otpCode string, encrypt 
 	if err := phoneChallenge.SetOtpCode(otpCode, encrypt, encryptionKeyID, encryptionKey); err != nil {
 		return nil, err
 	}
-	now := time.Now()
-	phoneChallenge.SentAt = &now
 	return phoneChallenge, nil
 }
 
@@ -238,14 +257,6 @@ func (f *Factor) UpdateFactorType(tx *storage.Connection, factorType string) err
 	return tx.UpdateOnly(f, "factor_type", "updated_at")
 }
 
-func (f *Factor) IsTOTPFactor() bool {
-	return f.FactorType == TOTP
-}
-
-func (f *Factor) IsPhoneFactor() bool {
-	return f.FactorType == Phone
-}
-
 func (f *Factor) DowngradeSessionsToAAL1(tx *storage.Connection) error {
 	sessions, err := FindSessionsByFactorID(tx, f.ID)
 	if err != nil {
@@ -265,6 +276,14 @@ func (f *Factor) IsOwnedBy(user *User) bool {
 
 func (f *Factor) IsVerified() bool {
 	return f.Status == FactorStateVerified.String()
+}
+
+func (f *Factor) IsUnverified() bool {
+	return f.Status == FactorStateUnverified.String()
+}
+
+func (f *Factor) IsPhoneFactor() bool {
+	return f.FactorType == Phone
 }
 
 func (f *Factor) FindChallengeByID(conn *storage.Connection, challengeID uuid.UUID) (*Challenge, error) {
@@ -304,7 +323,7 @@ func (f *Factor) FindLatestUnexpiredChallenge(tx *storage.Connection, expiryDura
 	var challenge Challenge
 	expirationTime := now.Add(time.Duration(expiryDuration) * time.Second)
 
-	err := tx.Where("sent_at > ?", expirationTime).
+	err := tx.Where("sent_at > ? and factor_id = ?", expirationTime, f.ID).
 		Order("sent_at desc").
 		First(&challenge)
 

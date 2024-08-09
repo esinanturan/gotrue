@@ -12,15 +12,11 @@ import (
 
 	"github.com/gofrs/uuid"
 
-	"database/sql"
-
-	"github.com/pkg/errors"
 	"github.com/pquerna/otp"
 	"github.com/supabase/auth/internal/api/sms_provider"
 	"github.com/supabase/auth/internal/conf"
 	"github.com/supabase/auth/internal/crypto"
 	"github.com/supabase/auth/internal/models"
-	"github.com/supabase/auth/internal/storage"
 	"github.com/supabase/auth/internal/utilities"
 
 	"github.com/pquerna/otp/totp"
@@ -62,7 +58,7 @@ func (ts *MFATestSuite) SetupTest() {
 	require.NoError(ts.T(), err, "Error creating test user model")
 	require.NoError(ts.T(), ts.API.db.Create(u), "Error saving new test user")
 	// Create Factor
-	f := models.NewFactor(u, "test_factor", models.TOTP, models.FactorStateUnverified)
+	f := models.NewTOTPFactor(u, "test_factor")
 	require.NoError(ts.T(), f.SetSecret("secretkey", ts.Config.Security.DBEncryption.Encrypt, ts.Config.Security.DBEncryption.EncryptionKeyID, ts.Config.Security.DBEncryption.EncryptionKey))
 	require.NoError(ts.T(), ts.API.db.Create(f), "Error saving new test factor")
 	// Create corresponding session
@@ -178,25 +174,109 @@ func (ts *MFATestSuite) TestEnrollFactor() {
 	for _, c := range cases {
 		ts.Run(c.desc, func() {
 			w := performEnrollFlow(ts, token, c.friendlyName, c.factorType, c.issuer, c.phone, c.expectedCode)
+			enrollResp := EnrollFactorResponse{}
+			require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&enrollResp))
 
-			factors, err := FindFactorsByUser(ts.API.db, ts.TestUser)
-			ts.Require().NoError(err)
-			addedFactor := factors[len(factors)-1]
-			require.False(ts.T(), addedFactor.IsVerified())
-			if c.friendlyName != "" && c.expectedCode == http.StatusOK {
-				require.Equal(ts.T(), c.friendlyName, addedFactor.FriendlyName)
+			if c.expectedCode == http.StatusOK {
+				addedFactor, err := models.FindFactorByFactorID(ts.API.db, enrollResp.ID)
+				require.NoError(ts.T(), err)
+				require.False(ts.T(), addedFactor.IsVerified())
+
+				if c.friendlyName != "" {
+					require.Equal(ts.T(), c.friendlyName, addedFactor.FriendlyName)
+				}
+
+				if c.factorType == models.TOTP {
+					qrCode := enrollResp.TOTP.QRCode
+					hasSVGStartAndEnd := strings.Contains(qrCode, "<svg") && strings.Contains(qrCode, "</svg>")
+					require.True(ts.T(), hasSVGStartAndEnd)
+					require.Equal(ts.T(), c.friendlyName, enrollResp.FriendlyName)
+				}
 			}
 
-			if w.Code == http.StatusOK && c.factorType == models.TOTP {
-				enrollResp := EnrollFactorResponse{}
-				require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&enrollResp))
-				qrCode := enrollResp.TOTP.QRCode
-				hasSVGStartAndEnd := strings.Contains(qrCode, "<svg") && strings.Contains(qrCode, "</svg>")
-				require.True(ts.T(), hasSVGStartAndEnd)
-				require.Equal(ts.T(), c.friendlyName, enrollResp.FriendlyName)
-			}
 		})
 	}
+}
+
+func (ts *MFATestSuite) TestDuplicateEnrollPhoneFactor() {
+	testPhoneNumber := "+12345677889"
+	altPhoneNumber := "+987412444444"
+	friendlyName := "phone_factor"
+	altFriendlyName := "alt_phone_factor"
+	token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
+
+	var cases = []struct {
+		desc                    string
+		earlierFactorName       string
+		laterFactorName         string
+		phone                   string
+		secondPhone             string
+		expectedCode            int
+		expectedNumberOfFactors int
+	}{
+		{
+			desc:                    "Phone: Only the latest factor should persist when enrolling two unverified phone factors with the same number",
+			earlierFactorName:       friendlyName,
+			laterFactorName:         altFriendlyName,
+			phone:                   testPhoneNumber,
+			secondPhone:             testPhoneNumber,
+			expectedNumberOfFactors: 1,
+		},
+
+		{
+			desc:                    "Phone: Both factors should persist when enrolling two different unverified numbers",
+			earlierFactorName:       friendlyName,
+			laterFactorName:         altFriendlyName,
+			phone:                   testPhoneNumber,
+			secondPhone:             altPhoneNumber,
+			expectedNumberOfFactors: 2,
+		},
+	}
+
+	for _, c := range cases {
+		ts.Run(c.desc, func() {
+			// Delete all test factors to start from clean slate
+			require.NoError(ts.T(), ts.API.db.Destroy(ts.TestUser.Factors))
+			_ = performEnrollFlow(ts, token, c.earlierFactorName, models.Phone, ts.TestDomain, c.phone, http.StatusOK)
+
+			w := performEnrollFlow(ts, token, c.laterFactorName, models.Phone, ts.TestDomain, c.secondPhone, http.StatusOK)
+			enrollResp := EnrollFactorResponse{}
+			require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&enrollResp))
+
+			laterFactor, err := models.FindFactorByFactorID(ts.API.db, enrollResp.ID)
+			require.NoError(ts.T(), err)
+			require.False(ts.T(), laterFactor.IsVerified())
+
+			require.NoError(ts.T(), ts.API.db.Eager("Factors").Find(ts.TestUser, ts.TestUser.ID))
+			require.Equal(ts.T(), len(ts.TestUser.Factors), c.expectedNumberOfFactors)
+
+		})
+	}
+}
+
+func (ts *MFATestSuite) TestDuplicateEnrollPhoneFactorWithVerified() {
+	testPhoneNumber := "+12345677889"
+	friendlyName := "phone_factor"
+	altFriendlyName := "alt_phone_factor"
+	token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
+
+	ts.Run("Phone: Enrolling a factor with the same number as an existing verified phone factor should result in an error", func() {
+		require.NoError(ts.T(), ts.API.db.Destroy(ts.TestUser.Factors))
+
+		// Setup verified factor
+		w := performEnrollFlow(ts, token, friendlyName, models.Phone, ts.TestDomain, testPhoneNumber, http.StatusOK)
+		enrollResp := EnrollFactorResponse{}
+		require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&enrollResp))
+		firstFactor, err := models.FindFactorByFactorID(ts.API.db, enrollResp.ID)
+		require.NoError(ts.T(), err)
+		require.NoError(ts.T(), firstFactor.UpdateStatus(ts.API.db, models.FactorStateVerified))
+
+		expectedStatusCode := http.StatusUnprocessableEntity
+		_ = performEnrollFlow(ts, token, altFriendlyName, models.Phone, ts.TestDomain, testPhoneNumber, expectedStatusCode)
+
+		require.NoError(ts.T(), ts.API.db.Eager("Factors").Find(ts.TestUser, ts.TestUser.ID))
+		require.Equal(ts.T(), len(ts.TestUser.Factors), 1)
+	})
 }
 
 func (ts *MFATestSuite) TestDuplicateTOTPEnrollsReturnExpectedMessage() {
@@ -224,30 +304,35 @@ func (ts *MFATestSuite) TestMultipleEnrollsCleanupExpiredFactors() {
 	accessTokenResp := &AccessTokenResponse{}
 	require.NoError(ts.T(), json.NewDecoder(resp.Body).Decode(&accessTokenResp))
 
+	var w *httptest.ResponseRecorder
 	token := accessTokenResp.Token
 	for i := 0; i < numFactors; i++ {
-		_ = performEnrollFlow(ts, token, "", models.TOTP, "https://issuer.com", "", http.StatusOK)
+		w = performEnrollFlow(ts, token, "", models.TOTP, "https://issuer.com", "", http.StatusOK)
 	}
 
-	// All Factors except last factor should be expired
-	factors, err := FindFactorsByUser(ts.API.db, ts.TestUser)
-	require.NoError(ts.T(), err)
+	enrollResp := EnrollFactorResponse{}
+	require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&enrollResp))
 
 	// Make a challenge so last, unverified factor isn't deleted on next enroll (Factor 2)
-	_ = performChallengeFlow(ts, factors[len(factors)-1].ID, token)
+	_ = performChallengeFlow(ts, enrollResp.ID, token)
 
 	// Enroll another Factor (Factor 3)
 	_ = performEnrollFlow(ts, token, "", models.TOTP, "https://issuer.com", "", http.StatusOK)
-	factors, err = FindFactorsByUser(ts.API.db, ts.TestUser)
-	require.NoError(ts.T(), err)
-	require.Equal(ts.T(), 3, len(factors))
+	require.NoError(ts.T(), ts.API.db.Eager("Factors").Find(ts.TestUser, ts.TestUser.ID))
+	require.Equal(ts.T(), 3, len(ts.TestUser.Factors))
 }
 
-func (ts *MFATestSuite) TestChallengeFactor() {
+func (ts *MFATestSuite) TestChallengeTOTPFactor() {
+	// Test Factor is a TOTP Factor
 	f := ts.TestUser.Factors[0]
 	token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
 	w := performChallengeFlow(ts, f.ID, token)
+	challengeResp := ChallengeFactorResponse{}
+	require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&challengeResp))
+
 	require.Equal(ts.T(), http.StatusOK, w.Code)
+	require.Equal(ts.T(), challengeResp.Type, models.TOTP)
+
 }
 
 func (ts *MFATestSuite) TestChallengeSMSFactor() {
@@ -265,19 +350,11 @@ func (ts *MFATestSuite) TestChallengeSMSFactor() {
         begin
             return input;
        end; $$ language plpgsql;`).Exec())
-	// We still need a mock provider for hooks to work right now for backward compatibility
-	// The WhatsApp channel is only valid when twilio or twilio verify is set.
-	ts.Config.Sms.Provider = "twilio"
-	ts.Config.Sms.Twilio = conf.TwilioProviderConfiguration{
-		AccountSid:        "test_account_sid",
-		AuthToken:         "test_auth_token",
-		MessageServiceSid: "test_message_service_id",
-	}
 
 	phone := "+1234567"
 	friendlyName := "testchallengesmsfactor"
 
-	f := models.NewPhoneFactor(ts.TestUser, phone, friendlyName, models.Phone, models.FactorStateUnverified)
+	f := models.NewPhoneFactor(ts.TestUser, phone, friendlyName)
 	require.NoError(ts.T(), ts.API.db.Create(f), "Error creating new SMS factor")
 	token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
 
@@ -301,6 +378,9 @@ func (ts *MFATestSuite) TestChallengeSMSFactor() {
 	for _, tc := range cases {
 		ts.Run(tc.desc, func() {
 			w := performSMSChallengeFlow(ts, f.ID, token, tc.channel)
+			challengeResp := ChallengeFactorResponse{}
+			require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&challengeResp))
+			require.Equal(ts.T(), challengeResp.Type, models.Phone)
 			require.Equal(ts.T(), tc.expectedCode, w.Code, tc.desc)
 		})
 	}
@@ -369,7 +449,7 @@ func (ts *MFATestSuite) TestMFAVerifyFactor() {
 
 			if v.factorType == models.TOTP {
 				friendlyName := uuid.Must(uuid.NewV4()).String()
-				f = models.NewFactor(ts.TestUser, friendlyName, models.TOTP, models.FactorStateUnverified)
+				f = models.NewTOTPFactor(ts.TestUser, friendlyName)
 				sharedSecret = ts.TestOTPKey.Secret()
 				f.Secret = sharedSecret
 				require.NoError(ts.T(), ts.API.db.Create(f), "Error updating new test factor")
@@ -379,7 +459,7 @@ func (ts *MFATestSuite) TestMFAVerifyFactor() {
 				otp, err := crypto.GenerateOtp(numDigits)
 				require.NoError(ts.T(), err)
 				phone := fmt.Sprintf("+%s", otp)
-				f = models.NewPhoneFactor(ts.TestUser, phone, friendlyName, models.Phone, models.FactorStateUnverified)
+				f = models.NewPhoneFactor(ts.TestUser, phone, friendlyName)
 				require.NoError(ts.T(), ts.API.db.Create(f), "Error creating new SMS factor")
 			}
 
@@ -462,12 +542,8 @@ func (ts *MFATestSuite) TestUnenrollVerifiedFactor() {
 			var buffer bytes.Buffer
 
 			// Create Session to test behaviour which downgrades other sessions
-			factors, err := FindFactorsByUser(ts.API.db, ts.TestUser)
-			require.NoError(ts.T(), err, "error finding factors")
-			f := factors[0]
-			f.Secret = ts.TestOTPKey.Secret()
+			f := ts.TestUser.Factors[0]
 			require.NoError(ts.T(), f.UpdateStatus(ts.API.db, models.FactorStateVerified))
-			require.NoError(ts.T(), ts.API.db.Update(f), "Error updating new test factor")
 			if v.isAAL2 {
 				ts.TestSession.UpdateAALAndAssociatedFactor(ts.API.db, models.AAL2, &f.ID)
 			}
@@ -491,7 +567,6 @@ func (ts *MFATestSuite) TestUnenrollVerifiedFactor() {
 func (ts *MFATestSuite) TestUnenrollUnverifiedFactor() {
 	var buffer bytes.Buffer
 	f := ts.TestUser.Factors[0]
-	f.Secret = ts.TestOTPKey.Secret()
 
 	token := ts.generateAAL1Token(ts.TestUser, &ts.TestSession.ID)
 	require.NoError(ts.T(), json.NewEncoder(&buffer).Encode(map[string]interface{}{
@@ -567,6 +642,30 @@ func (ts *MFATestSuite) TestMFAFollowedByPasswordSignIn() {
 	session, err := models.FindSessionByUserID(ts.API.db, accessTokenResp.User.ID)
 	require.NoError(ts.T(), err)
 	require.True(ts.T(), session.IsAAL2())
+}
+
+func (ts *MFATestSuite) TestChallengeFactorNotOwnedByUser() {
+	var buffer bytes.Buffer
+	email := "nomfaenabled@test.com"
+	password := "testpassword"
+	signUpResp := signUp(ts, email, password)
+
+	friendlyName := "testfactor"
+	phoneNumber := "+1234567"
+
+	otherUsersPhoneFactor := models.NewPhoneFactor(ts.TestUser, phoneNumber, friendlyName)
+	require.NoError(ts.T(), ts.API.db.Create(otherUsersPhoneFactor), "Error creating factor")
+
+	w := ServeAuthenticatedRequest(ts, http.MethodPost, fmt.Sprintf("http://localhost/factors/%s/challenge", otherUsersPhoneFactor.ID), signUpResp.Token, buffer)
+
+	expectedError := notFoundError(ErrorCodeMFAFactorNotFound, "Factor not found")
+
+	var data HTTPError
+	require.NoError(ts.T(), json.NewDecoder(w.Body).Decode(&data))
+
+	require.Equal(ts.T(), expectedError.ErrorCode, data.ErrorCode)
+	require.Equal(ts.T(), http.StatusNotFound, w.Code)
+
 }
 
 func signUp(ts *MFATestSuite, email, password string) (signUpResp AccessTokenResponse) {
@@ -819,16 +918,4 @@ func cleanupHook(ts *MFATestSuite, hookName string) {
 	cleanupHookSQL := fmt.Sprintf("drop function if exists %s", hookName)
 	err := ts.API.db.RawQuery(cleanupHookSQL).Exec()
 	require.NoError(ts.T(), err)
-}
-
-// FindFactorsByUser returns all factors belonging to a user ordered by timestamp. Don't use this outside of tests.
-func FindFactorsByUser(tx *storage.Connection, user *models.User) ([]*models.Factor, error) {
-	factors := []*models.Factor{}
-	if err := tx.Q().Where("user_id = ?", user.ID).Order("created_at asc").All(&factors); err != nil {
-		if errors.Cause(err) == sql.ErrNoRows {
-			return factors, nil
-		}
-		return nil, errors.Wrap(err, "Database error when finding MFA factors associated to user")
-	}
-	return factors, nil
 }
